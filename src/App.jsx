@@ -43,9 +43,12 @@ function toDateStr(val) {
   return s.slice(0, 10);
 }
 
-// True if two YYYY-MM-DD strings are within `tol` days of each other.
-// Default 1 day so feedback sent the morning after a late-night ticket still counts.
-function datesWithin(d1, d2, tol = 1) {
+// Business rule: feedback must go out on the SAME calendar day as the ticket.
+// Next-day (or later) counts as a late submission. To allow a wider window,
+// bump FEEDBACK_DAY_TOLERANCE to 1 (next day OK), 2, etc.
+const FEEDBACK_DAY_TOLERANCE = 0;
+
+function datesWithin(d1, d2, tol = FEEDBACK_DAY_TOLERANCE) {
   if (!d1 || !d2) return false;
   const a = new Date(`${d1}T00:00:00`);
   const b = new Date(`${d2}T00:00:00`);
@@ -88,11 +91,12 @@ function processTickets(ticketRows, spoolerMap) {
     if (!isDuplicate) seen.set(key, idx);
 
     const existsInSpooler = spoolerMap.has(phone);
-    // Match against ANY spooler date for this phone within the tolerance window,
-    // instead of requiring an exact same-day string match.
+    // A feedback message counts only if it was sent within FEEDBACK_DAY_TOLERANCE
+    // days of the ticket. With tolerance 0 this means the exact same calendar day;
+    // anything later falls through to "Date mismatch (late feedback)".
     const sameDateInSpooler =
       existsInSpooler &&
-      [...spoolerMap.get(phone)].some((sd) => datesWithin(sd, date, 1));
+      [...spoolerMap.get(phone)].some((sd) => datesWithin(sd, date));
 
     let status = "Valid";
     let reason = "";
@@ -111,24 +115,12 @@ function processTickets(ticketRows, spoolerMap) {
     return { ...row, Status: status, Reason: reason, _phone: phone, _date: date };
   });
 
-  const dupKeys = new Set();
-  const keyCounts = new Map();
-  results.forEach((r) => {
-    const k = `${r._phone}__${r._date}`;
-    keyCounts.set(k, (keyCounts.get(k) || 0) + 1);
-  });
-  results.forEach((r) => {
-    const k = `${r._phone}__${r._date}`;
-    if (keyCounts.get(k) > 1) dupKeys.add(k);
-  });
-
-  return results.map((r) => {
-    const k = `${r._phone}__${r._date}`;
-    if (dupKeys.has(k)) {
-      return { ...r, Status: "Invalid", Reason: r.Reason || "Duplicate ticket" };
-    }
-    return r;
-  });
+  // Duplicate rule: the FIRST ticket for a given phone+date is kept as-is
+  // (valid if it otherwise passes); every later copy is flagged "Duplicate ticket".
+  // This is handled inline above via the `seen` map, so no second pass is needed —
+  // an earlier version re-marked every copy invalid, which wrongly voided the
+  // original too.
+  return results;
 }
 
 // Parse a CSV/TSV text blob into row objects WITHOUT date coercion.
@@ -174,7 +166,19 @@ async function readFile(file) {
 }
 
 function downloadFile(results, format) {
-  const clean = results.map(({ _phone, _date, ...rest }) => rest);
+  // Long numeric IDs (Ticket number, Customer CLI) get rendered as scientific
+  // notation (e.g. 1.78042E+12) when written as numeric cells, destroying the ID.
+  // Force ID-like columns to strings so the full digits survive the export.
+  const ID_COLUMNS = ["Ticket number", "Customer CLI"];
+  const clean = results.map(({ _phone, _date, ...rest }) => {
+    const row = { ...rest };
+    ID_COLUMNS.forEach((col) => {
+      if (row[col] !== undefined && row[col] !== null && row[col] !== "") {
+        row[col] = String(row[col]);
+      }
+    });
+    return row;
+  });
   if (format === "csv") {
     const ws = XLSX.utils.json_to_sheet(clean);
     const csv = XLSX.utils.sheet_to_csv(ws);
