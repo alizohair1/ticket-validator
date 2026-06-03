@@ -131,23 +131,46 @@ function processTickets(ticketRows, spoolerMap) {
   });
 }
 
-function readFile(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const data = e.target.result;
-        const wb = XLSX.read(data, { type: "array", cellDates: true });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
-        resolve(rows);
-      } catch (err) {
-        reject(err);
-      }
-    };
-    reader.onerror = reject;
-    reader.readAsArrayBuffer(file);
+// Parse a CSV/TSV text blob into row objects WITHOUT date coercion.
+// This is the key fix: the spooler is a tab-separated text file whose dates
+// are DD/MM/YYYY. If we hand it to SheetJS, it guesses US MM/DD and locks in
+// the wrong date (e.g. 03/06/2026 -> March 6 instead of June 3). Keeping the
+// raw string lets toDateStr() apply the correct DD/MM parsing.
+function parseDelimitedText(text) {
+  const lines = text
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .filter((l) => l.length);
+  if (!lines.length) return [];
+  const delim = lines[0].includes("\t") ? "\t" : ",";
+  const headers = lines[0].split(delim).map((h) => h.trim());
+  return lines.slice(1).map((line) => {
+    const cells = line.split(delim);
+    const obj = {};
+    headers.forEach((h, i) => {
+      obj[h] = (cells[i] ?? "").trim();
+    });
+    return obj;
   });
+}
+
+async function readFile(file) {
+  const buf = await file.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  // Real .xlsx starts with "PK" (zip); legacy .xls starts with the OLE magic D0 CF.
+  const isZip = bytes[0] === 0x50 && bytes[1] === 0x4b;
+  const isOle = bytes[0] === 0xd0 && bytes[1] === 0xcf;
+
+  if (!isZip && !isOle) {
+    // Plain text masquerading as .xls/.csv — parse manually, preserve raw dates.
+    const text = new TextDecoder("utf-8").decode(buf);
+    return parseDelimitedText(text);
+  }
+
+  const wb = XLSX.read(buf, { type: "array", cellDates: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  return XLSX.utils.sheet_to_json(ws, { defval: "" });
 }
 
 function downloadFile(results, format) {
