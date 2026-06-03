@@ -14,20 +14,53 @@ function extractPhoneFromTicketName(name) {
   return digits.slice(-12);
 }
 
+// Normalize ANY input (JS Date, "DD/MM/YYYY ...", "YYYY-MM-DD ...") to "YYYY-MM-DD".
+// IMPORTANT: for Date objects we read LOCAL components, not toISOString(),
+// because toISOString() converts to UTC and can shift the day for evening tickets.
 function toDateStr(val) {
-  if (!val) return "";
-  if (val instanceof Date) {
-    return val.toISOString().slice(0, 10);
+  if (val === null || val === undefined || val === "") return "";
+
+  if (val instanceof Date && !isNaN(val)) {
+    const y = val.getFullYear();
+    const m = String(val.getMonth() + 1).padStart(2, "0");
+    const d = String(val.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
   }
-  return String(val).slice(0, 10);
+
+  const s = String(val).trim();
+
+  // DD/MM/YYYY or D/M/YYYY (the spooler format), with optional trailing time
+  const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+  if (dmy) {
+    const [, d, m, y] = dmy;
+    return `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+  }
+
+  // Already ISO-ish: YYYY-MM-DD...
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return iso[0];
+
+  return s.slice(0, 10);
+}
+
+// True if two YYYY-MM-DD strings are within `tol` days of each other.
+// Default 1 day so feedback sent the morning after a late-night ticket still counts.
+function datesWithin(d1, d2, tol = 1) {
+  if (!d1 || !d2) return false;
+  const a = new Date(`${d1}T00:00:00`);
+  const b = new Date(`${d2}T00:00:00`);
+  if (isNaN(a) || isNaN(b)) return false;
+  const diffDays = Math.abs(a - b) / 86400000;
+  return diffDays <= tol;
 }
 
 function parseSpooler(rows) {
-  // returns Map: phone -> Set of date strings
+  // returns Map: phone -> Set of canonical date strings (YYYY-MM-DD)
   const map = new Map();
   rows.forEach((r) => {
     const dest = r["DEST"] ?? r["dest"] ?? r["Dest"] ?? "";
-    const createdAt = r["CREATED AT"] ?? r["created at"] ?? r["Created At"] ?? r["createdAt"] ?? "";
+    const createdAt =
+      r["CREATED AT"] ?? r["created at"] ?? r["Created At"] ?? r["createdAt"] ?? "";
     const phone = normalizePhone(dest);
     const date = toDateStr(createdAt);
     if (!phone || !date) return;
@@ -38,8 +71,7 @@ function parseSpooler(rows) {
 }
 
 function processTickets(ticketRows, spoolerMap) {
-  // Track duplicates: key = phone+date
-  const seen = new Map(); // key -> index of first occurrence
+  const seen = new Map();
 
   const results = ticketRows.map((row, idx) => {
     const ticketName = row["Ticket name"] ?? row["ticket name"] ?? row["TICKET NAME"] ?? "";
@@ -56,7 +88,11 @@ function processTickets(ticketRows, spoolerMap) {
     if (!isDuplicate) seen.set(key, idx);
 
     const existsInSpooler = spoolerMap.has(phone);
-    const sameDateInSpooler = existsInSpooler && spoolerMap.get(phone).has(date);
+    // Match against ANY spooler date for this phone within the tolerance window,
+    // instead of requiring an exact same-day string match.
+    const sameDateInSpooler =
+      existsInSpooler &&
+      [...spoolerMap.get(phone)].some((sd) => datesWithin(sd, date, 1));
 
     let status = "Valid";
     let reason = "";
@@ -75,7 +111,6 @@ function processTickets(ticketRows, spoolerMap) {
     return { ...row, Status: status, Reason: reason, _phone: phone, _date: date };
   });
 
-  // Second pass: mark first occurrence as duplicate too if its key appears more than once
   const dupKeys = new Set();
   const keyCounts = new Map();
   results.forEach((r) => {
